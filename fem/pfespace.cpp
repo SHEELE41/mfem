@@ -3309,24 +3309,46 @@ DeviceConformingProlongationOperator::DeviceConformingProlongationOperator(
 static void ExtractSubVector(const Array<int> &indices,
                              const Vector &in, Vector &out)
 {
+   // 사이즈 검증 테스트 코드
    MFEM_ASSERT(indices.Size() == out.Size(), "incompatible sizes!");
+   
+   // out vector에 대한 쓰기 권한이 있는 메모리 포인터를 y에 할당
    auto y = out.Write();
+
+   // in vector에 대한 읽기 권한이 있는 메모리 포인터를 x에 할당
    const auto x = in.Read();
+
+   // indices array에 대한 읽기 권한이 있는 메모리 포인터를 I에 할당
    const auto I = indices.Read();
+
+   // 임의의 Device에 대한 병렬화를 위한 for 루프를 지원하는 매크로
+   // 실제로는 다음 코드와 같이 기능함
+   /*
+      for(int i=0; i<indices.Size(); i++) {
+         y[i] = x[I[i]];
+      }
+   */ 
    MFEM_FORALL(i, indices.Size(), y[i] = x[I[i]];); // indices can be repeated
 }
 
 void DeviceConformingProlongationOperator::BcastBeginCopy(
    const Vector &x) const
 {
-   // shr_buf[i] = src[shr_ltdof[i]]
+   // 사이즈가 0이면 아무것도 안 함
    if (shr_ltdof.Size() == 0) { return; }
+
+   // shr_ltdof 배열 사이즈만큼 i를 0부터 1씩 증가시키며 아래 작업을 실행
+   // shr_buf[i] = src[shr_ltdof[i]]
    ExtractSubVector(shr_ltdof, x, shr_buf);
+
    // If the above kernel is executed asynchronously, we should wait for it to
    // complete
+   // 위 함수가 비동기적으로 실행되었다면 완료될 때까지 기다린다는 의미
+   // 사실상 mpi_gpu_aware 에 따라 결정
    if (mpi_gpu_aware) { MFEM_STREAM_SYNC; }
 }
 
+// Read에서 내부적으로 cuMemcpyHtoD 호출됨
 static void SetSubVector(const Array<int> &indices,
                          const Vector &in, Vector &out)
 {
@@ -3354,52 +3376,94 @@ void DeviceConformingProlongationOperator::BcastEndCopy(
    SetSubVector(ext_ldof, ext_buf, y);
 }
 
+// shr는 Shared, ext는 external의 약자로 예상됨.
+// shr는 여러 프로세스가 공유하는 메모리 영역, ext는 각 프로세스에 개별로 속한 메모리 영역이 아닐까?
 void DeviceConformingProlongationOperator::Mult(const Vector &x,
                                                 Vector &y) const
 {
    const GroupTopology &gtopo = gc.GetGroupTopology();
    int req_counter = 0;
    // Make sure 'y' is marked as valid on device and for use on device.
+   // y가 Device에서 유효하고 사용할 수 있는지 확인.
    // This ensures that there is no unnecessary host to device copy when the
    // input 'y' is valid on host (in 'y.SetSubVector(ext_ldof, 0.0)' when local
    // is true) or BcastLocalCopy (when local is false).
+   // 만약 y가 Host에서 유효하다면 H2D 작업이 불필요하다는 것은 자명한 사실이다. (local이 true일 경우)
+   // 그렇지 않다면 BcastLocalCopy를 실행 (local이 false일 경우)
+
+   // mfem::Vector::Write - Shortcut for mfem::Write(vec.GetMemory(), vec.Size(), on_dev)
+   /* 
+      [mfem::Write]
+      Get a pointer for write access to mem with the mfem::Device's DeviceMemoryClass, if on_dev = true, or the mfem::Device's HostMemoryClass, otherwise.
+      Also, if on_dev = true, the device flag of mem will be set.
+      Definition at line 336 of file device.hpp.
+   */
    y.Write();
+
    if (local)
    {
       // done on device since we've marked ext_ldof for use on device:
       y.SetSubVector(ext_ldof, 0.0);
    }
-   else
-   {
-      BcastBeginCopy(x); // copy to 'shr_buf'
+   else  // 결국 하는 일은 shr_buf -> ext_buf 로 데이터 전송
+   { 
+      // shr_buf가 Device 주소인지 Host 주소인지는 알 수 없음
+      BcastBeginCopy(x); // copy to 'shr_buf' ( shr_buf[i] = x[shr_ltdof[i]] )
+
+      // 같은 토폴로지 내의 이웃한 프로세스의 번호를 구한 뒤, 1부터 시작하여 직전까지의 모든 프로세스에 대해 루프
       for (int nbr = 1; nbr < gtopo.GetNumNeighbors(); nbr++)
       {
+         // shr_buf_offsets 배열으로부터 현재 인덱스(토폴로지 내의 프로세스 넘버) send_offset을 구함
          const int send_offset = shr_buf_offsets[nbr];
+
+         // send_size는 다음 인덱스의 offset - 현재 인덱스의 offset
+         // 결국 shr_buf_offsets[nbr+1] - shr_buf_offsets[nbr]
          const int send_size = shr_buf_offsets[nbr+1] - send_offset;
+
+         // 보낼 것이 있다면
          if (send_size > 0)
          {
+            // gam true이면 Device 메모리에서 읽고 false이면 Host 메모리에서 읽음
+            // HostRead()는 내부적으로 cuMemcpyDtoH를 호출 (D2H)
             auto send_buf = mpi_gpu_aware ? shr_buf.Read() : shr_buf.HostRead();
+
+            // MPI_ISend를 이용하여 현재 인덱스 기준 이웃 프로세스에게 데이터를 송신 (tag : 41822)
             MPI_Isend(send_buf + send_offset, send_size, MPI_DOUBLE,
                       gtopo.GetNeighborRank(nbr), 41822,
                       gtopo.GetComm(), &requests[req_counter++]);
          }
+
+         // ext_buf_offsets 배열으로부터 현재 인덱스(토폴로지 내의 프로세스 넘버) recv_offset을 구함
          const int recv_offset = ext_buf_offsets[nbr];
+
+         // recv_size는 다음 인덱스의 offset - 현재 인덱스의 offset
+         // 역시 ext_buf_offsets[nbr+1] - ext_buf_offsets[nbr]
          const int recv_size = ext_buf_offsets[nbr+1] - recv_offset;
+
+         // 받을 것이 있다면
          if (recv_size > 0)
          {
+            // gam true이면 Device 메모리에 쓰고 false이면 Host 메모리에 씀
+            // Write는 쓰는 작업을 의미하는 것이 아니라 쓰기 권한과 함께 메모리 포인터를 얻는 작업.
             auto recv_buf = mpi_gpu_aware ? ext_buf.Write() : ext_buf.HostWrite();
+
+            // MPI_IRecv를 이용하여 현재 인덱스 기준 이웃 프로세스가 보낸 데이터를 수신 (tag : 41822)
             MPI_Irecv(recv_buf + recv_offset, recv_size, MPI_DOUBLE,
                       gtopo.GetNeighborRank(nbr), 41822,
                       gtopo.GetComm(), &requests[req_counter++]);
          }
       }
    }
-   BcastLocalCopy(x, y);
+
+   // local이 true이든 false이든 BcastLocalCopy는 실행되어야 하므로 밖으로 나와있음
+   BcastLocalCopy(x, y);   // y[ltdof_ldof[i]] = x[i]
+
    if (!local)
    {
       MPI_Waitall(req_counter, requests, MPI_STATUSES_IGNORE);
-      BcastEndCopy(y); // copy from 'ext_buf'
+      BcastEndCopy(y); // copy from 'ext_buf' ( y[ext_ldof[i]] = ext_buf[i] )
    }
+   // 결과는 y를 통해 반환됨
 }
 
 DeviceConformingProlongationOperator::~DeviceConformingProlongationOperator()

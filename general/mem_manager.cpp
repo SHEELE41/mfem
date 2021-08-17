@@ -1396,6 +1396,8 @@ void MemoryManager::EraseAlias(void *alias_ptr)
    maps->aliases.erase(alias_map_iter);
 }
 
+// GetDevicePtr, GetHostPtr 중요 함수
+// Read_ 혹은 Write_, CopyToHost_ 등 함수로부터 호출
 void *MemoryManager::GetDevicePtr(const void *h_ptr, size_t bytes,
                                   bool copy_data)
 {
