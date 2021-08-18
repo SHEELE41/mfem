@@ -20,7 +20,7 @@
 #ifdef MFEM_CONFIG_FILE
 #include MFEM_CONFIG_FILE
 #else
-#include "_config.hpp"
+// #include "_config.hpp"
 #endif
 
 // Common configuration macros

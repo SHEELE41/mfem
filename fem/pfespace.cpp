@@ -3331,6 +3331,7 @@ static void ExtractSubVector(const Array<int> &indices,
    MFEM_FORALL(i, indices.Size(), y[i] = x[I[i]];); // indices can be repeated
 }
 
+// void BcastBeginCopy(const Vector &src) const; - MPI send 작업을 위한 준비
 void DeviceConformingProlongationOperator::BcastBeginCopy(
    const Vector &x) const
 {
@@ -3348,29 +3349,42 @@ void DeviceConformingProlongationOperator::BcastBeginCopy(
    if (mpi_gpu_aware) { MFEM_STREAM_SYNC; }
 }
 
-// Read에서 내부적으로 cuMemcpyHtoD 호출됨
+// in.Read에서 내부적으로 cuMemcpyHtoD 호출됨
 static void SetSubVector(const Array<int> &indices,
                          const Vector &in, Vector &out)
 {
    MFEM_ASSERT(indices.Size() == in.Size(), "incompatible sizes!");
+   // 전체 indice의 일부만 변경할 것이므로 ReadWrite 사용 
    // Use ReadWrite() since we modify only a subset of the indices:
    auto y = out.ReadWrite();
    const auto x = in.Read();
    const auto I = indices.Read();
+
+   // 임의의 Device에 대한 병렬화를 위한 for 루프를 지원하는 매크로
+   // 실제로는 다음 코드와 같이 기능함
+   /*
+      for(int i=0; i<indices.Size(); i++) {
+         y[I[i]] = x[i]];
+      }
+   */ 
    MFEM_FORALL(i, indices.Size(), y[I[i]] = x[i];);
 }
 
+// void BcastLocalCopy(const Vector &src, Vector &dst) const;
 void DeviceConformingProlongationOperator::BcastLocalCopy(
    const Vector &x, Vector &y) const
 {
+   // ltdof_ldof 배열 사이즈만큼 i를 0부터 1씩 증가시키며 아래 작업을 실행
    // dst[ltdof_ldof[i]] = src[i]
    if (ltdof_ldof.Size() == 0) { return; }
    SetSubVector(ltdof_ldof, x, y);
 }
 
+// void BcastEndCopy(const Vector &dst) const; - MPI recv 완료 후 실행
 void DeviceConformingProlongationOperator::BcastEndCopy(
    Vector &y) const
 {
+   // ext_ldof 배열 사이즈만큼 i를 0부터 1씩 증가시키며 아래 작업을 실행
    // dst[ext_ldof[i]] = ext_buf[i]
    if (ext_ldof.Size() == 0) { return; }
    SetSubVector(ext_ldof, ext_buf, y);
